@@ -59,7 +59,7 @@ CRITICAL PRIORITY - LANGUAGE CONSISTENCY:
 ENHANCEMENT REQUIREMENTS:
 1. Return only the enhanced prompt text; do not add explanations, prefaces, markdown fences, labels, or analysis.
 2. Do not include language labels or meta notes such as "User input is in Chinese" or "Response must be in Chinese".
-3. Preserve the user's original intent, topic, constraints, target output type, and exact code blocks, file paths, URLs, @mentions, and identifiers. Do not answer the request.
+3. Preserve the user's original intent, topic, constraints, target output type, and exact code blocks, file paths, URLs (including full query parameters like ?... and hash anchors like #...), @mentions, and identifiers. Never omit, shorten, or replace URLs with generic phrases. Do not answer the request.
 4. Always make a substantive enhancement when possible: clarify the task, scope, constraints, and expected output.
 5. If the original prompt is already clear, lightly polish it instead of returning it unchanged.
 6. Keep the enhanced prompt complete and concise. Do not end with an unfinished list, dangling conjunction, or trailing colon.
@@ -299,11 +299,99 @@ export function cleanEnhancedOutput(value, original = '') {
   return { ok: true, text: output };
 }
 
+const URL_MATCH_RE = /https?:\/\/[^\s<>"'`\u3000-\u303F\uFF00-\uFFEF\u4E00-\u9FFF]+/g;
+
+function trimUrlToken(raw = '') {
+  let url = String(raw || '');
+  while (url) {
+    const stripped = url.replace(/[.,;:!?，。；：！？]+$/, '');
+    if (stripped !== url) {
+      url = stripped;
+      continue;
+    }
+    const last = url.slice(-1);
+    const open = { ')': '(', ']': '[', '}': '{' }[last];
+    if (!open) break;
+    const openCount = url.split(open).length - 1;
+    const closeCount = url.split(last).length - 1;
+    if (closeCount > openCount) {
+      url = url.slice(0, -1);
+      continue;
+    }
+    break;
+  }
+  return url;
+}
+
+export function extractUrls(input = '') {
+  const matches = String(input ?? '').match(URL_MATCH_RE) || [];
+  return matches.map((token) => trimUrlToken(token)).filter(Boolean);
+}
+
+function getUrlBaseKey(url = '') {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.host.toLowerCase()}${parsed.pathname.replace(/\/+$/, '')}`;
+  } catch {
+    return '';
+  }
+}
+
+export function restoreMissingUrls(original = '', enhanced = '') {
+  const originalUrls = [];
+  const seen = new Set();
+  for (const url of extractUrls(original)) {
+    if (seen.has(url)) continue;
+    seen.add(url);
+    originalUrls.push(url);
+  }
+  let result = String(enhanced ?? '');
+  if (originalUrls.length === 0) return result;
+
+  const missing = originalUrls.filter((url) => !result.includes(url));
+  if (missing.length === 0) return result;
+
+  const missingByBase = new Map();
+  for (const url of missing) {
+    const base = getUrlBaseKey(url);
+    if (base) missingByBase.set(base, (missingByBase.get(base) || 0) + 1);
+  }
+
+  for (const origUrl of missing) {
+    const base = getUrlBaseKey(origUrl);
+    if (!base || missingByBase.get(base) !== 1) continue;
+    const candidates = Array.from(
+      new Set(extractUrls(result).filter((cand) => !seen.has(cand) && getUrlBaseKey(cand) === base)),
+    );
+    if (candidates.length === 1) {
+      const cand = candidates[0];
+      result = result.replace(URL_MATCH_RE, (raw) => {
+        const trimmed = trimUrlToken(raw);
+        return trimmed === cand ? raw.replace(trimmed, origUrl) : raw;
+      });
+    }
+  }
+
+  const stillMissing = originalUrls.filter((url) => !result.includes(url));
+  if (stillMissing.length > 0) {
+    const header = /[\u3400-\u9fff]/.test(String(original)) ? '参考链接：' : 'Reference links:';
+    const sep = result.trim() ? '\n\n' : '';
+    result = `${result.trimEnd()}${sep}${header}\n${stillMissing.map((url) => `- ${url}`).join('\n')}`;
+  }
+  return result;
+}
+
 export function extractProtectedTokens(input = '') {
   const matches = String(input ?? '').match(
-    /```[^\n]*\n[\s\S]*?```|`[^`\n]+`|https?:\/\/[^\s<>"，。；！？）]+|@[\w./\\-]+|(?:[A-Za-z]:\\|~?\/|(?:[\w.@-]+\/)+)[\w.@/\\-]+|\b[\w@.-]+\.(?:js|ts|tsx|jsx|mjs|cjs|py|cs|vue|json|md|sh|txt)\b|\b[A-Za-z]+(?:[A-Z][a-z0-9]+){1,}\b|\b[a-zA-Z]+_[a-zA-Z_0-9]+\b/g,
+    /```[^\n]*\n[\s\S]*?```|`[^`\n]+`|https?:\/\/[^\s<>"'`\u3000-\u303F\uFF00-\uFFEF\u4E00-\u9FFF]+|@[\w./\\-]+|(?:[A-Za-z]:\\|~?\/|(?:[\w.@-]+\/)+)[\w.@/\\-]+|\b[\w@.-]+\.(?:js|ts|tsx|jsx|mjs|cjs|py|cs|vue|json|md|sh|txt)\b|\b[A-Za-z]+(?:[A-Z][a-z0-9]+){1,}\b|\b[a-zA-Z]+_[a-zA-Z_0-9]+\b/g,
   ) || [];
-  return matches.map((token) => (token.startsWith('`') ? token : token.replace(/[.,;:!?，。；：！？）)\]}]+$/, '')));
+  return matches
+    .map((token) => {
+      if (token.startsWith('`')) return token;
+      if (/^https?:\/\//i.test(token)) return trimUrlToken(token);
+      return token.replace(/[.,;:!?，。；：！？）)\]}]+$/, '');
+    })
+    .filter(Boolean);
 }
 
 export function preservesProtectedTokens(input = '', output = '') {
@@ -348,8 +436,8 @@ export function stripPromptAsterisks(text = '') {
       protectedParts.push(match);
       return `\u0000${protectedParts.length - 1}\u0000`;
     })
-    // Keep inline and fenced code intact.
-    .replace(/```[\s\S]*?```|`[^`\n]*`/g, (match) => {
+    // Keep inline and fenced code and URLs (e.g. wildcard queries) intact.
+    .replace(/```[\s\S]*?```|`[^`\n]*`|https?:\/\/[^\s<>"'`\u3000-\u303F\uFF00-\uFFEF\u4E00-\u9FFF]+/g, (match) => {
       protectedParts.push(match);
       return `\u0000${protectedParts.length - 1}\u0000`;
     });
@@ -599,11 +687,12 @@ export class PromptEnhancerService {
       if (!cleaned.ok) return cleaned;
       const enhanced = stripPromptAsterisks(cleaned.text).trim();
       if (!enhanced) return { ok: false, reason: 'empty-response', error: 'model_returned_empty_prompt' };
-      const outputIssue = detectOutputIssue(safeOriginal, enhanced);
-      const tokensPreserved = preservesProtectedTokens(safeOriginal, enhanced);
+      const finalEnhanced = restoreMissingUrls(safeOriginal, enhanced).trim();
+      const outputIssue = detectOutputIssue(safeOriginal, finalEnhanced);
+      const tokensPreserved = preservesProtectedTokens(safeOriginal, finalEnhanced);
       return {
         ok: true,
-        enhanced: enhanced.slice(0, 16000),
+        enhanced: finalEnhanced.slice(0, 16000),
         taskType,
         model: backend.model,
         profileName: backend.profileName,

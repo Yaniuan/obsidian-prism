@@ -16,7 +16,9 @@ import {
   detectOutputIssue,
   extractAssistantResult,
   extractProtectedTokens,
+  extractUrls,
   preservesProtectedTokens,
+  restoreMissingUrls,
   sanitizeEnhancerTurns,
   stripPromptAsterisks,
 } from '../vendor/prompt-enhancer/prompt-enhancer-service.mjs';
@@ -263,6 +265,29 @@ test('output cleaning, protected tokens, finish_reason, and language guards work
   );
   assert.equal(preservesProtectedTokens('Edit src/auth/session.ts', 'Edit src/auth/login.ts'), false);
   assert.equal(extractProtectedTokens('Call `foo_bar` at https://a.test/x.').includes('https://a.test/x'), true);
+
+  // URL extraction handles Chinese delimiters, balanced parentheses, query params, anchors, and asterisks
+  const multiLinkDraft = [
+    '请参考文档：https://github.com/owner/repo?tab=readme&page=2#usage、https://en.wikipedia.org/wiki/Foo_(bar)?action=view#History，',
+    '还有[说明](https://example.com/a?x=1#top)和https://example.com/search?q=*foo*#L10-L20测试',
+  ].join('\n');
+  assert.deepEqual(extractUrls(multiLinkDraft), [
+    'https://github.com/owner/repo?tab=readme&page=2#usage',
+    'https://en.wikipedia.org/wiki/Foo_(bar)?action=view#History',
+    'https://example.com/a?x=1#top',
+    'https://example.com/search?q=*foo*#L10-L20',
+  ]);
+  for (const url of extractUrls(multiLinkDraft)) {
+    assert.equal(extractProtectedTokens(multiLinkDraft).includes(url), true);
+  }
+  assert.equal(
+    stripPromptAsterisks('**重点**：检查 https://example.com/search?q=*foo*&b=*bar*#top 和 *斜体*'),
+    '重点：检查 https://example.com/search?q=*foo*&b=*bar*#top 和 斜体'
+  );
+  assert.equal(
+    restoreMissingUrls('See https://example.com/docs?v=1#intro', 'See https://example.com/docs'),
+    'See https://example.com/docs?v=1#intro'
+  );
 
   assert.equal(detectOutputIssue('解释代码', 'User input is in Chinese\n请解释代码'), 'preface');
   assert.equal(detectOutputIssue('请帮我解释这段代码的功能', 'Please explain what this code does in detail.'), 'language-mismatch');
@@ -919,4 +944,81 @@ test('Daemon routes enhancer actions through the shared trusted binding and reso
   } finally {
     await daemon.stop(false).catch(() => {});
   }
+});
+
+test('service preserves and restores multiple URLs including query parameters and hash anchors', async () => {
+  const draft = [
+    '请对比以下三个页面的接口差异：',
+    '1. https://example.com/docs?lang=zh&tab=api#auth',
+    '2. https://github.com/org/repo/issues/12?page=2&sort=created#issuecomment-99',
+    '3. https://en.wikipedia.org/wiki/Foo_(bar)?action=view#History',
+  ].join('\n');
+  const expectedUrls = [
+    'https://example.com/docs?lang=zh&tab=api#auth',
+    'https://github.com/org/repo/issues/12?page=2&sort=created#issuecomment-99',
+    'https://en.wikipedia.org/wiki/Foo_(bar)?action=view#History',
+  ];
+
+  // Case 1: Model keeps one link and drops the other two
+  const dir1 = fs.mkdtempSync(path.join(os.tmpdir(), 'prism-pe-url-drop-'));
+  const svcDrop = new PromptEnhancerService({
+    configDir: dir1,
+    translatorService: makeTranslator({
+      body: { choices: [{ message: { content: '请对比 https://example.com/docs?lang=zh&tab=api#auth 与其他相关文档中的接口差异，并给出结构化对比结论。' } }] },
+    }),
+    getEnabled: () => true,
+  });
+  svcDrop.saveConfig({ enabled: true, profileId: 'default', model: 'gpt-mini' });
+  const resDrop = await svcDrop.enhance({ original: draft });
+  assert.equal(resDrop.ok, true);
+  assert.equal(resDrop.tokensPreserved, true);
+  for (const url of expectedUrls) assert.equal(resDrop.enhanced.includes(url), true);
+  svcDrop.dispose();
+
+  // Case 2: Model strips query parameters and #anchors from URLs
+  const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'prism-pe-url-trunc-'));
+  const svcTrunc = new PromptEnhancerService({
+    configDir: dir2,
+    translatorService: makeTranslator({
+      body: {
+        choices: [{
+          message: {
+            content: [
+              '请系统对比以下三个文档的接口差异：',
+              '- 文档一：https://example.com/docs',
+              '- 文档二：https://github.com/org/repo/issues/12',
+              '- 文档三：https://en.wikipedia.org/wiki/Foo_(bar)',
+            ].join('\n'),
+          },
+        }],
+      },
+    }),
+    getEnabled: () => true,
+  });
+  svcTrunc.saveConfig({ enabled: true, profileId: 'default', model: 'gpt-mini' });
+  const resTrunc = await svcTrunc.enhance({ original: draft });
+  assert.equal(resTrunc.ok, true);
+  assert.equal(resTrunc.tokensPreserved, true);
+  for (const url of expectedUrls) assert.equal(resTrunc.enhanced.includes(url), true);
+  assert.equal(resTrunc.enhanced.includes('参考链接：'), false);
+  svcTrunc.dispose();
+});
+
+test('Prompt Enhancer client keeps multi-link URLs with query params, anchors, and asterisks intact', async () => {
+  const draft = '对比 https://example.com/search?q=*foo*&page=1#results 和 https://docs.test/guide?mode=raw#L10-L20';
+  const enhancedFromServer = '**目标**：请对比 https://example.com/search?q=*foo*&page=1#results 与 https://docs.test/guide?mode=raw#L10-L20 的 *关键差异*。';
+  const { win, doc, editor, requests, runtime } = createUiHarness();
+  editor.textContent = draft;
+  await until(() => doc.querySelector('[data-testid="prism-prompt-enhancer-trigger"]'));
+  doc.querySelector('[data-testid="prism-prompt-enhancer-trigger"]').click();
+  await until(() => requests.some((r) => r.action === 'enhance'));
+  const req = requests.find((r) => r.action === 'enhance');
+  assert.equal(req.payload.original, draft);
+  win.__agPrismPromptEnhancerBridge.resolve(req.id, { ok: true, enhanced: enhancedFromServer, tokensPreserved: true, outputIssue: '' });
+  await until(() => editor.textContent.includes('目标：请对比'));
+  assert.equal(
+    editor.textContent,
+    '目标：请对比 https://example.com/search?q=*foo*&page=1#results 与 https://docs.test/guide?mode=raw#L10-L20 的 关键差异。'
+  );
+  runtime.destroy();
 });

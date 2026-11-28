@@ -177,20 +177,12 @@
   }
 
   function sanitizeEnhancedText(value) {
-    const protectedParts = [];
-    let text = String(value ?? '')
-      .replace(/\*{1,2}\/[^\s]+/g, (match) => {
-        protectedParts.push(match);
-        return `\u0000${protectedParts.length - 1}\u0000`;
-      })
-      .replace(/```[\s\S]*?```|`[^`\n]*`/g, (match) => {
-        protectedParts.push(match);
-        return `\u0000${protectedParts.length - 1}\u0000`;
-      });
-    text = text
+    const p = [];
+    const text = String(value ?? '')
+      .replace(/```[\s\S]*?```|`[^`\n]*`|https?:\/\/[^\s<>"'`\u3000-\u303F\uFF00-\uFFEF\u4E00-\u9FFF]+|\*{1,2}\/[^\s]+/g, (m) => `\u0000${p.push(m) - 1}\u0000`)
       .replace(/(^|[^\w*])\*\*(\S(?:[^*\n]*?\S)?)\*\*(?=$|[^\w*])/g, '$1$2')
       .replace(/(^|[^\w*])\*(\S(?:[^*\n]*?\S)?)\*(?=$|[^\w*])/g, '$1$2');
-    return text.replace(/\u0000(\d+)\u0000/g, (_, index) => protectedParts[Number(index)] || '');
+    return text.replace(/\u0000(\d+)\u0000/g, (_, i) => p[Number(i)] || '');
   }
 
   function dispatchEditorEvent(doc, editor, type, init = {}) {
